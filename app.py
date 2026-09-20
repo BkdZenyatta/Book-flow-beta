@@ -384,6 +384,49 @@ def obter_logs_erros():
     ).fetchall()
 
 
+# --- ADMINISTRAÇÃO DO ACERVO (só admin) ---
+def _exigir_admin():
+  if st.session_state.get("usuario_role") != "admin":
+    raise PermissionError("Apenas administradores podem alterar o banco.")
+
+
+def listar_registros_admin():
+  """Todos os registros: (titulo, tem_resumo, idioma)."""
+  with db() as conn:
+    return conn.execute(
+        "SELECT titulo, COALESCE(resumo, '') <> '', COALESCE(idioma, ?)"
+        " FROM resumos ORDER BY titulo ASC",
+        (IDIOMA_PADRAO,),
+    ).fetchall()
+
+
+def excluir_livros(titulos):
+  """Apaga os registros por completo (resumo e PDF)."""
+  _exigir_admin()
+  with db() as conn:
+    conn.executemany("DELETE FROM resumos WHERE titulo = ?", [(t,) for t in titulos])
+  return len(titulos)
+
+
+def limpar_resumos(titulos):
+  """Apaga só o resumo e mantém o PDF vinculado (se houver)."""
+  _exigir_admin()
+  with db() as conn:
+    for t in titulos:
+      conn.execute("UPDATE resumos SET resumo = '' WHERE titulo = ?", (t,))
+      conn.execute(
+          "DELETE FROM resumos WHERE titulo = ? AND COALESCE(pdf_url, '') = ''",
+          (t,),
+      )
+  return len(titulos)
+
+
+def limpar_logs_erros():
+  _exigir_admin()
+  with db() as conn:
+    conn.execute("DELETE FROM erros_log")
+
+
 init_db()
 
 
@@ -884,7 +927,75 @@ with st.sidebar.expander("🔐 Área do Administrador"):
       st.session_state["usuario_role"] = None
       st.rerun()
 
+def _esconder_resultado_se_afetado(chaves):
+  """Se o livro aberto na tela foi apagado, some com o resumo antigo."""
+  if _chave(st.session_state.get("current_query", "")) in chaves:
+    for k in ("search_active", "resumo", "resumo_ok", "pdf_info", "audiobooks"):
+      st.session_state.pop(k, None)
+
+
+def _cb_excluir():
+  sel = st.session_state.get("admin_sel", [])
+  if not sel or not st.session_state.get("admin_confirma"):
+    st.session_state["admin_msg"] = (
+        "warning", "Selecione ao menos um livro e marque a confirmação."
+    )
+    return
+  n = excluir_livros(sel)
+  _esconder_resultado_se_afetado(set(sel))
+  st.session_state["admin_msg"] = ("success", f"{n} registro(s) excluído(s).")
+  st.session_state["admin_sel"] = []
+  st.session_state["admin_confirma"] = False
+
+
+def _cb_limpar_resumo():
+  sel = st.session_state.get("admin_sel", [])
+  if not sel or not st.session_state.get("admin_confirma"):
+    st.session_state["admin_msg"] = (
+        "warning", "Selecione ao menos um livro e marque a confirmação."
+    )
+    return
+  n = limpar_resumos(sel)
+  _esconder_resultado_se_afetado(set(sel))
+  st.session_state["admin_msg"] = (
+      "success", f"Resumo apagado em {n} livro(s). O PDF foi mantido."
+  )
+  st.session_state["admin_sel"] = []
+  st.session_state["admin_confirma"] = False
+
+
+def _cb_limpar_erros():
+  limpar_logs_erros()
+  st.session_state["admin_msg"] = ("success", "Registro de erros limpo.")
+
+
 if st.session_state["usuario_role"] == "admin":
+  with st.sidebar.expander("🧹 Gerenciar Acervo"):
+    rotulos = {
+        t: f"{t.title()} [{idm}]" + ("" if tem else " (só PDF)")
+        for t, tem, idm in listar_registros_admin()
+    }
+    st.multiselect(
+        "Selecione os livros:",
+        options=list(rotulos),
+        format_func=lambda k: rotulos[k],
+        key="admin_sel",
+        placeholder="Escolha um ou mais...",
+    )
+    st.checkbox("Confirmo que quero fazer esta alteração", key="admin_confirma")
+    st.button(
+        "🗑️ Excluir livro(s) do banco", on_click=_cb_excluir, key="btn_excluir"
+    )
+    st.button(
+        "♻️ Apagar só o resumo (mantém o PDF)",
+        on_click=_cb_limpar_resumo,
+        key="btn_limpar_resumo",
+    )
+    msg_admin = st.session_state.pop("admin_msg", None)
+    if msg_admin:
+      getattr(st, msg_admin[0])(msg_admin[1])
+    st.caption("Depois de apagar, pesquise o livro de novo para gerar um resumo novo.")
+
   with st.sidebar.expander("🗄️ Banco de Dados"):
     st.code(str(DB_PATH), language="text")
     st.write(f"Livros com resumo: **{contar_livros()}**")
@@ -892,6 +1003,11 @@ if st.session_state["usuario_role"] == "admin":
       st.caption(f"Tamanho: {DB_PATH.stat().st_size / 1024:.0f} KB")
 
   with st.sidebar.expander("🛠️ Registro de Erros por Livro"):
+    st.button(
+        "🧹 Limpar registro de erros",
+        on_click=_cb_limpar_erros,
+        key="btn_limpar_erros",
+    )
     logs = obter_logs_erros()
     if logs:
       for l in logs:
