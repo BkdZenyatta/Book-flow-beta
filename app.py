@@ -8,6 +8,7 @@ import re
 import socket
 import sqlite3
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from html import unescape
 from io import BytesIO
@@ -50,7 +51,60 @@ SITES_PREFERIDOS = [
     "clubedolivrodesatolep.wordpress.com",
 ]
 
-MODELOS = ["gemini-2.5-flash", "gemini-2.0-flash"]  # mantenha atualizado
+# Idiomas: nome usado no prompt, região do buscador, códigos do archive.org
+# e a expressão usada na busca de audiobooks.
+IDIOMAS = {
+    "Português": {
+        "nome": "português do Brasil",
+        "ddg": "br-pt",
+        "archive": ["por", "Portuguese"],
+        "audiobook": "audiobook completo",
+    },
+    "English": {
+        "nome": "English",
+        "ddg": "us-en",
+        "archive": ["eng", "English"],
+        "audiobook": "full audiobook",
+    },
+    "Español": {
+        "nome": "español",
+        "ddg": "es-es",
+        "archive": ["spa", "Spanish"],
+        "audiobook": "audiolibro completo",
+    },
+    "Français": {
+        "nome": "français",
+        "ddg": "fr-fr",
+        "archive": ["fra", "fre", "French"],
+        "audiobook": "livre audio complet",
+    },
+    "Deutsch": {
+        "nome": "Deutsch",
+        "ddg": "de-de",
+        "archive": ["deu", "ger", "German"],
+        "audiobook": "Hörbuch komplett",
+    },
+    "Italiano": {
+        "nome": "italiano",
+        "ddg": "it-it",
+        "archive": ["ita", "Italian"],
+        "audiobook": "audiolibro completo",
+    },
+}
+IDIOMA_PADRAO = "Português"
+
+# Modelos do Gemini: o app descobre os disponíveis via API; esta lista só é
+# usada se a consulta falhar. Os nomes mudam rápido, por isso a busca dinâmica.
+MODELOS_FALLBACK = [
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+]
+MODELOS_EXCLUIR = (
+    "image", "live", "tts", "audio", "transcribe", "embedding",
+    "robotics", "computer", "native", "learnlm",
+)
 CODES_TENTAR_OUTRO = {404, 429, 500, 503}
 
 # Textos das mensagens de erro (usados também para limpar lixo antigo do banco)
@@ -120,7 +174,8 @@ def init_db():
             fonte TEXT,
             pdf_url TEXT,
             autor TEXT,
-            paginas INTEGER
+            paginas INTEGER,
+            idioma TEXT
         )
     """)
     conn.execute("""
@@ -143,6 +198,7 @@ def init_db():
     # Migração de bancos antigos
     _garantir_coluna(conn, "resumos", "autor", "TEXT")
     _garantir_coluna(conn, "resumos", "paginas", "INTEGER")
+    _garantir_coluna(conn, "resumos", "idioma", "TEXT")
     _garantir_coluna(conn, "erros_log", "livro", "TEXT")
 
     # Remove mensagens de erro que foram salvas por engano como resumo
@@ -181,13 +237,16 @@ def _chave(titulo):
   return " ".join(titulo.lower().split())
 
 
-def salvar_no_banco(titulo, resumo, fonte="IA", pdf_url="", autor="", paginas=0):
+def salvar_no_banco(
+    titulo, resumo, fonte="IA", pdf_url="", autor="", paginas=0,
+    idioma=IDIOMA_PADRAO,
+):
   with db() as conn:
     conn.execute(
         """INSERT OR REPLACE INTO resumos
-           (titulo, resumo, fonte, pdf_url, autor, paginas)
-           VALUES (?, ?, ?, ?, ?, ?)""",
-        (_chave(titulo), resumo, fonte, pdf_url, autor, paginas),
+           (titulo, resumo, fonte, pdf_url, autor, paginas, idioma)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (_chave(titulo), resumo, fonte, pdf_url, autor, paginas, idioma),
     )
 
 
@@ -204,7 +263,7 @@ def atualizar_pdf_no_banco(titulo, pdf_url, autor, paginas):
 def buscar_no_banco(titulo):
   with db() as conn:
     row = conn.execute(
-        "SELECT resumo, fonte, pdf_url, autor, paginas FROM resumos"
+        "SELECT resumo, fonte, pdf_url, autor, paginas, idioma FROM resumos"
         " WHERE titulo = ?",
         (_chave(titulo),),
     ).fetchone()
@@ -215,6 +274,7 @@ def buscar_no_banco(titulo):
         "pdf_url": row[2],
         "autor": row[3],
         "paginas": row[4],
+        "idioma": row[5] or IDIOMA_PADRAO,  # registros antigos eram em pt
     }
   return None
 
@@ -253,8 +313,9 @@ def traduzir_e_registrar_erro(erro, titulo="Desconhecido"):
     )
   elif code == 404 or "NOT_FOUND" in erro_str:
     msg = (
-        "❌ **Modelo Indisponível:** O modelo de IA solicitado não foi"
-        " localizado (Erro 404)."
+        "❌ **Modelo Indisponível:** Nenhum modelo do Gemini respondeu"
+        " (Erro 404). Atualize o SDK com `pip install -U google-genai` e"
+        " reinicie o app."
     )
   elif (
       code in (401, 403)
@@ -298,7 +359,7 @@ def obter_logs_erros():
 init_db()
 
 
-# --- PDF (com proteção contra SSRF e arquivos gigantes) ---
+# --- DOWNLOAD SEGURO (proteção contra SSRF e arquivos gigantes) ---
 def _url_segura(url):
   p = urllib.parse.urlparse(url)
   if p.scheme not in ("http", "https") or not p.hostname:
@@ -357,13 +418,18 @@ def baixar_pdf_web(url):
 
 
 def _texto_relevante(titulo, texto):
-  """Confere se o texto do PDF realmente parece ser do livro buscado."""
+  """Confere se o início do texto (capa / título) bate com o livro buscado.
+
+  Títulos curtos (até 3 palavras) exigem todas as palavras; os maiores,
+  pelo menos 70%.
+  """
   t = titulo.lower()
   palavras = re.findall(r"\w{4,}", t) or re.findall(r"\w+", t)
   if not palavras:
     return False
-  alvo = texto.lower()
-  return sum(p in alvo for p in palavras) / len(palavras) >= 0.5
+  alvo = texto[:1500].lower()
+  minimo = 1.0 if len(palavras) <= 3 else 0.7
+  return sum(p in alvo for p in palavras) / len(palavras) >= minimo
 
 
 def _tentar_pdf(titulo, url):
@@ -395,18 +461,21 @@ def _extrair_links_pdf(pagina_url, maximo=2):
   return list(dict.fromkeys(absolutos))[:maximo]
 
 
-def buscar_pdf_archive_org(titulo):
-  """Busca via API oficial do archive.org (mais confiável que scraping)."""
+# --- BUSCA DE PDFs (archive.org > sites preferidos > web geral) ---
+def buscar_pdf_archive_org(titulo, idioma):
+  """Busca via API oficial do archive.org, filtrando pelo idioma escolhido."""
   termo = " ".join(re.findall(r"\w+", titulo))
   if not termo:
     return None
 
+  langs = " OR ".join(f"language:{c}" for c in IDIOMAS[idioma]["archive"])
   r = requests.get(
       "https://archive.org/advancedsearch.php",
       params={
-          "q": f"({termo}) AND mediatype:texts",
+          "q": f"({termo}) AND mediatype:texts AND ({langs})",
           "fl[]": ["identifier", "title"],
-          "rows": 5,
+          "sort[]": "downloads desc",  # mais populares primeiro
+          "rows": 6,
           "output": "json",
       },
       headers=HEADERS,
@@ -458,12 +527,15 @@ def buscar_pdf_archive_org(titulo):
   return None
 
 
-def buscar_pdf_nos_sites(titulo):
+def buscar_pdf_nos_sites(titulo, idioma):
   """Pesquisa nos sites da lista SITES_PREFERIDOS e procura PDFs nas páginas."""
+  regiao = IDIOMAS[idioma]["ddg"]
   for dominio in SITES_PREFERIDOS:
     try:
       with DDGS(timeout=8) as ddgs:
-        paginas = list(ddgs.text(f"site:{dominio} {titulo}", max_results=3))
+        paginas = list(
+            ddgs.text(f"site:{dominio} {titulo}", region=regiao, max_results=3)
+        )
     except Exception:
       log.warning("Busca em %s falhou", dominio, exc_info=True)
       continue
@@ -488,10 +560,16 @@ def buscar_pdf_nos_sites(titulo):
   return None
 
 
-def buscar_pdf_web_geral(titulo):
-  """Último recurso: busca geral por PDFs na web."""
+def buscar_pdf_web_geral(titulo, idioma):
+  """Último recurso: busca geral por PDFs na web, na região do idioma."""
   with DDGS(timeout=8) as ddgs:
-    resultados = list(ddgs.text(f"{titulo} filetype:pdf", max_results=4))
+    resultados = list(
+        ddgs.text(
+            f"{titulo} filetype:pdf",
+            region=IDIOMAS[idioma]["ddg"],
+            max_results=4,
+        )
+    )
   for item in resultados:
     url = item.get("href", "")
     if url:
@@ -501,7 +579,7 @@ def buscar_pdf_web_geral(titulo):
   return None
 
 
-def buscar_pdf_relacionado(titulo):
+def buscar_pdf_relacionado(titulo, idioma):
   """Tenta as fontes em ordem: archive.org, sites preferidos, web geral."""
   for busca in (
       buscar_pdf_archive_org,
@@ -509,7 +587,7 @@ def buscar_pdf_relacionado(titulo):
       buscar_pdf_web_geral,
   ):
     try:
-      achado = busca(titulo)
+      achado = busca(titulo, idioma)
     except Exception:
       log.warning("Fonte %s falhou", busca.__name__, exc_info=True)
       continue
@@ -519,32 +597,77 @@ def buscar_pdf_relacionado(titulo):
 
 
 # --- IA (Gemini) ---
-def gerar_resumo_gemini(titulo, texto_base, api_key):
-  """Retorna (ok: bool, texto: str)."""
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def _modelos_disponiveis(api_key):
+  """Pergunta ao Google quais modelos Flash existem hoje (os nomes mudam)."""
+  try:
+    client = genai.Client(api_key=api_key)
+    candidatos = []
+    for m in client.models.list():
+      nome = (m.name or "").replace("models/", "")
+      acoes = getattr(m, "supported_actions", None) or ["generateContent"]
+      if (
+          nome.startswith("gemini-")
+          and "flash" in nome
+          and "generateContent" in acoes
+          and not any(x in nome for x in MODELOS_EXCLUIR)
+      ):
+        v = re.search(r"gemini-(\d+(?:\.\d+)?)", nome)
+        versao = float(v.group(1)) if v else 0.0
+        # estáveis antes de preview, versão mais nova antes, "lite" por último
+        candidatos.append(
+            (("preview" not in nome), versao, ("lite" not in nome), nome)
+        )
+    candidatos.sort(reverse=True)
+    nomes = [c[3] for c in candidatos][:4]
+    if nomes:
+      return nomes
+  except Exception:
+    log.warning("Não foi possível listar os modelos do Gemini", exc_info=True)
+  return MODELOS_FALLBACK
+
+
+def gerar_resumo_gemini(titulo, texto_base, api_key, idioma=IDIOMA_PADRAO):
+  """Retorna (ok, texto, trecho_valido).
+
+  trecho_valido: True/False se a IA confirmou/negou que o trecho do PDF é do
+  livro; None se não houve resposta sobre isso.
+  """
   if not api_key or not api_key.strip():
     return False, (
         "🔑 **Chave de API não inserida.** Digite uma chave no menu lateral."
-    )
+    ), None
 
+  nome_idioma = IDIOMAS[idioma]["nome"]
   prompt = f"""
-    Você é um especialista em literatura. Faça um resumo conciso, envolvente e bem estruturado do livro '{titulo}'.
-
-    Estrutura desejada:
-    1. **Visão Geral e Contexto**
-    2. **Principais Tópicos / Capítulos-Chave**
-    3. **Conclusão e Ensinamento Central**
+    Você é um especialista em literatura. Escreva TODA a resposta em {nome_idioma}.
+    Faça um resumo conciso, envolvente e bem estruturado do livro '{titulo}'.
+    Se o título for ambíguo (por exemplo, apenas um número), considere a obra literária mais conhecida com esse título.
 
     Trecho extraído de um PDF (use apenas se for realmente do livro; caso contrário, ignore):
     {texto_base if texto_base else "Nenhum texto extraído."}
+
+    Formato obrigatório da resposta:
+    - Linha 1: exatamente "TRECHO_DO_LIVRO: SIM" se o trecho acima pertence a esse livro, ou "TRECHO_DO_LIVRO: NAO" se não pertence ou se não há trecho.
+    - Depois, uma linha em branco e o resumo com esta estrutura (traduza os títulos das seções):
+    1. **Visão Geral e Contexto**
+    2. **Principais Tópicos / Capítulos-Chave**
+    3. **Conclusão e Ensinamento Central**
     """
 
   client = genai.Client(api_key=api_key.strip())
   ultimo_erro = None
-  for mod in MODELOS:
+  for mod in _modelos_disponiveis(api_key.strip()):
     try:
       resp = client.models.generate_content(model=mod, contents=prompt)
-      if resp.text:
-        return True, resp.text
+      txt = (resp.text or "").strip()
+      valido = None
+      m = re.match(r"\s*TRECHO_DO_LIVRO:\s*(SIM|NAO|NÃO)\b[^\n]*\n?", txt, re.I)
+      if m:
+        valido = m.group(1).upper() == "SIM"
+        txt = txt[m.end():].strip()
+      if txt:
+        return True, txt, valido
       ultimo_erro = ValueError("Resposta vazia ou bloqueada pelo modelo.")
     except Exception as e:
       ultimo_erro = e
@@ -554,7 +677,7 @@ def gerar_resumo_gemini(titulo, texto_base, api_key):
       ):
         break
 
-  return False, traduzir_e_registrar_erro(ultimo_erro, titulo=titulo)
+  return False, traduzir_e_registrar_erro(ultimo_erro, titulo=titulo), None
 
 
 # --- WORD ---
@@ -591,69 +714,92 @@ def criar_arquivo_docx(titulo, conteudo):
   return buffer
 
 
-# --- YOUTUBE ---
-def _buscar_audiobooks(query):
-  videos_encontrados = []
+# --- YOUTUBE (só vídeos que existem, no idioma e com o título certo) ---
+def _video_id(href):
+  m = re.search(r"(?:v=|youtu\.be/|/shorts/|/embed/)([A-Za-z0-9_-]{11})", href)
+  return m.group(1) if m else None
+
+
+def _validar_videos(query, ids):
+  """Confere no YouTube (oEmbed) se cada vídeo existe e bate com o livro."""
+
+  def checar(vid):
+    link = f"https://www.youtube.com/watch?v={vid}"
+    try:
+      r = requests.get(
+          "https://www.youtube.com/oembed",
+          params={"url": link, "format": "json"},
+          headers=HEADERS,
+          timeout=5,
+      )
+      if r.status_code != 200:  # removido, privado ou bloqueado
+        return None
+      d = r.json()
+    except Exception:
+      return None
+
+    titulo_video = d.get("title", "")
+    if not _texto_relevante(query, titulo_video):
+      return None
+    return {
+        "title": titulo_video,
+        "link": link,
+        "views": f"Canal: {d.get('author_name', 'YouTube')}",
+        "image": d.get("thumbnail_url")
+        or f"https://img.youtube.com/vi/{vid}/hqdefault.jpg",
+    }
+
+  with ThreadPoolExecutor(max_workers=6) as ex:
+    return [v for v in ex.map(checar, ids) if v]
+
+
+def _buscar_audiobooks(query, idioma):
+  cfg = IDIOMAS[idioma]
+  ids = []
+
   try:
     with DDGS(timeout=8) as ddgs:
       resultados = list(
-          ddgs.text(f"site:youtube.com {query} audiobook completo", max_results=6)
+          ddgs.text(
+              f"site:youtube.com {query} {cfg['audiobook']}",
+              region=cfg["ddg"],
+              max_results=10,
+          )
       )
     for r in resultados:
-      href = r.get("href", "")
-      if "youtube.com/watch" in href or "youtu.be/" in href:
-        vid_id = ""
-        if "v=" in href:
-          vid_id = href.split("v=")[1].split("&")[0]
-        elif "youtu.be/" in href:
-          vid_id = href.split("youtu.be/")[1].split("?")[0]
-
-        thumb = (
-            f"https://img.youtube.com/vi/{vid_id}/hqdefault.jpg"
-            if vid_id
-            else None
-        )
-        videos_encontrados.append({
-            "title": r.get("title", f"Audiobook - {query}"),
-            "link": href,
-            "views": "Resultado da busca",
-            "image": thumb,
-        })
+      vid = _video_id(r.get("href", ""))
+      if vid:
+        ids.append(vid)
   except Exception:
     log.warning("Busca de audiobooks (DDG) falhou", exc_info=True)
 
-  if not videos_encontrados:
+  if len(ids) < 3:  # complementa com a busca do próprio YouTube
     try:
+      termo_yt = f"{query} {cfg['audiobook']}"
       search_url = (
           "https://www.youtube.com/results?search_query="
-          f"{urllib.parse.quote(query + ' audiobook completo')}"
+          + urllib.parse.quote(termo_yt)
       )
       res = requests.get(search_url, headers=HEADERS, timeout=6)
-      video_ids = re.findall(r"watch\?v=([a-zA-Z0-9_-]{11})", res.text)
-      for v_id in list(dict.fromkeys(video_ids))[:4]:
-        videos_encontrados.append({
-            "title": f"Audiobook Completo: {query.title()}",
-            "link": f"https://www.youtube.com/watch?v={v_id}",
-            "views": "Sugestão do YouTube",
-            "image": f"https://img.youtube.com/vi/{v_id}/hqdefault.jpg",
-        })
+      ids += re.findall(r"watch\?v=([a-zA-Z0-9_-]{11})", res.text)
     except Exception:
       log.warning("Busca de audiobooks (scraping) falhou", exc_info=True)
 
-  return videos_encontrados
+  ids = list(dict.fromkeys(ids))[:12]
+  return _validar_videos(query, ids)[:5]
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def _audiobooks_cacheado(query):
-  videos = _buscar_audiobooks(query)
+def _audiobooks_cacheado(query, idioma):
+  videos = _buscar_audiobooks(query, idioma)
   if not videos:
     raise LookupError("sem resultados")  # exceção não entra no cache
   return videos
 
 
-def buscar_audiobooks_youtube(query):
+def buscar_audiobooks_youtube(query, idioma=IDIOMA_PADRAO):
   try:
-    return _audiobooks_cacheado(query)
+    return _audiobooks_cacheado(query, idioma)
   except LookupError:
     return []
 
@@ -666,6 +812,7 @@ for chave_estado, valor in (
     ("usuario_role", None),
     ("resumo_ok", False),
     ("geracoes", 0),
+    ("idioma_busca", IDIOMA_PADRAO),
 ):
   st.session_state.setdefault(chave_estado, valor)
 
@@ -723,6 +870,12 @@ if st.session_state["usuario_role"] == "admin":
 
 # --- COMPONENTE DE BUSCA ---
 with st.expander("🗂️ Pesquisar no Acervo Salvo ou Digitar Novo", expanded=True):
+  idioma = st.selectbox(
+      "🌐 Idioma da pesquisa e do resumo:",
+      options=list(IDIOMAS),
+      index=list(IDIOMAS).index(IDIOMA_PADRAO),
+  )
+
   livros_disponiveis = listar_livros_salvos()
 
   termo_busca_input = st.selectbox(
@@ -735,6 +888,7 @@ with st.expander("🗂️ Pesquisar no Acervo Salvo ou Digitar Novo", expanded=T
       "Ou digite o nome de um novo livro para buscar online:",
       value="",
       max_chars=200,
+      help="Dica: título + autor (ex.: 1984 George Orwell) melhora a precisão.",
   )
 
   query_final = (
@@ -749,12 +903,13 @@ with st.expander("🗂️ Pesquisar no Acervo Salvo ou Digitar Novo", expanded=T
     else:
       st.session_state["search_active"] = True
       st.session_state["current_query"] = query_final
+      st.session_state["idioma_busca"] = idioma
 
       with st.spinner("Processando informações do livro..."):
         cache = buscar_no_banco(query_final)
         pdf_info = {"url": "", "autor": "", "paginas": 0, "texto_preview": ""}
 
-        if cache and cache["resumo"]:
+        if cache and cache["resumo"] and cache["idioma"] == idioma:
           # Tudo vem do banco local, sem rede
           resumo_gerado, resumo_ok = cache["resumo"], True
           pdf_info.update(
@@ -770,14 +925,19 @@ with st.expander("🗂️ Pesquisar no Acervo Salvo ou Digitar Novo", expanded=T
               False,
           )
         else:
-          achado = buscar_pdf_relacionado(query_final)
+          achado = buscar_pdf_relacionado(query_final, idioma)
           if achado:
             pdf_info = achado
 
-          resumo_ok, resumo_gerado = gerar_resumo_gemini(
-              query_final, pdf_info["texto_preview"], gemini_key
+          resumo_ok, resumo_gerado, trecho_valido = gerar_resumo_gemini(
+              query_final, pdf_info["texto_preview"], gemini_key, idioma
           )
           st.session_state["geracoes"] += 1
+
+          if achado and trecho_valido is False:
+            # A IA leu o trecho e disse que não é o livro: descarta o PDF
+            log.info("IA rejeitou o PDF encontrado: %s", achado["url"])
+            pdf_info = {"url": "", "autor": "", "paginas": 0, "texto_preview": ""}
 
           if resumo_ok:
             salvar_no_banco(
@@ -787,17 +947,21 @@ with st.expander("🗂️ Pesquisar no Acervo Salvo ou Digitar Novo", expanded=T
                 pdf_url=pdf_info["url"],
                 autor=pdf_info["autor"],
                 paginas=pdf_info["paginas"],
+                idioma=idioma,
             )
 
         st.session_state["resumo"] = resumo_gerado
         st.session_state["resumo_ok"] = resumo_ok
         st.session_state["pdf_info"] = pdf_info
-        st.session_state["audiobooks"] = buscar_audiobooks_youtube(query_final)
+        st.session_state["audiobooks"] = buscar_audiobooks_youtube(
+            query_final, idioma
+        )
 
 
 # --- EXIBIÇÃO DE RESULTADOS (3 TABS) ---
 if st.session_state.get("search_active"):
   q_atual = st.session_state.get("current_query", "")
+  idioma_res = st.session_state.get("idioma_busca", IDIOMA_PADRAO)
   st.markdown(f"### Resultados para: **{q_atual.title()}**")
 
   tab1, tab2, tab3 = st.tabs(
@@ -894,7 +1058,7 @@ if st.session_state.get("search_active"):
               st.markdown("🎬 **Vídeo do YouTube**")
           with col_v2:
             st.subheader(video["title"])
-            st.caption(f"Status: {video.get('views', 'Disponível')}")
+            st.caption(video.get("views", "Disponível"))
 
             link_vid = video.get("link")
             if link_vid:
@@ -902,12 +1066,13 @@ if st.session_state.get("search_active"):
               with st.expander("▶️ Player do Vídeo"):
                 st.video(link_vid)
     else:
-      st.info("Nenhum audiobook encontrado diretamente.")
+      st.info("Nenhum audiobook disponível encontrado para esta busca.")
 
     st.markdown("---")
+    termo_yt = q_atual + " " + IDIOMAS[idioma_res]["audiobook"]
     yt_direct_link = (
         "https://www.youtube.com/results?search_query="
-        f"{urllib.parse.quote(q_atual + ' audiobook completo')}"
+        + urllib.parse.quote(termo_yt)
     )
     st.markdown(
         f"🔗 **[Pesquisar '{q_atual} Audiobook' diretamente no YouTube]({yt_direct_link})**"
