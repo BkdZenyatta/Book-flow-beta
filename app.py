@@ -201,6 +201,21 @@ def init_db():
     _garantir_coluna(conn, "resumos", "idioma", "TEXT")
     _garantir_coluna(conn, "erros_log", "livro", "TEXT")
 
+    # Importa o banco antigo, caso ele estivesse em outra pasta (a pasta onde
+    # o Streamlit foi iniciado). Nada é apagado nem duplicado.
+    antigo = Path.cwd() / "bookflow.db"
+    try:
+      if antigo.exists() and antigo.resolve() != DB_PATH.resolve():
+        conn.execute("ATTACH DATABASE ? AS antigo", (str(antigo),))
+        conn.execute(
+            "INSERT OR IGNORE INTO resumos (titulo, resumo, fonte, pdf_url)"
+            " SELECT titulo, resumo, fonte, pdf_url FROM antigo.resumos"
+        )
+        conn.commit()
+        conn.execute("DETACH DATABASE antigo")
+    except Exception:
+      log.warning("Não foi possível importar o banco antigo", exc_info=True)
+
     # Remove mensagens de erro que foram salvas por engano como resumo
     for marcador in MARCADORES_ERRO_ANTIGOS:
       conn.execute("DELETE FROM resumos WHERE instr(resumo, ?) > 0", (marcador,))
@@ -250,14 +265,19 @@ def salvar_no_banco(
     )
 
 
-def atualizar_pdf_no_banco(titulo, pdf_url, autor, paginas):
-  """Atualiza só os dados do PDF, sem mexer no resumo. Retorna True se existia."""
+def salvar_pdf_manual(titulo, pdf_url, autor, paginas, idioma=IDIOMA_PADRAO):
+  """Guarda o PDF vinculado à mão, mesmo que o resumo ainda não exista."""
   with db() as conn:
-    cur = conn.execute(
-        "UPDATE resumos SET pdf_url = ?, autor = ?, paginas = ? WHERE titulo = ?",
-        (pdf_url, autor, paginas, _chave(titulo)),
+    conn.execute(
+        """INSERT INTO resumos
+           (titulo, resumo, fonte, pdf_url, autor, paginas, idioma)
+           VALUES (?, '', 'manual', ?, ?, ?, ?)
+           ON CONFLICT(titulo) DO UPDATE SET
+             pdf_url = excluded.pdf_url,
+             autor = excluded.autor,
+             paginas = excluded.paginas""",
+        (_chave(titulo), pdf_url, autor, paginas, idioma),
     )
-    return cur.rowcount > 0
 
 
 def buscar_no_banco(titulo):
@@ -282,9 +302,17 @@ def buscar_no_banco(titulo):
 def listar_livros_salvos():
   with db() as conn:
     rows = conn.execute(
-        "SELECT titulo FROM resumos ORDER BY titulo ASC"
+        "SELECT titulo FROM resumos WHERE COALESCE(resumo, '') <> ''"
+        " ORDER BY titulo ASC"
     ).fetchall()
   return [r[0].title() for r in rows]
+
+
+def contar_livros():
+  with db() as conn:
+    return conn.execute(
+        "SELECT COUNT(*) FROM resumos WHERE COALESCE(resumo, '') <> ''"
+    ).fetchone()[0]
 
 
 def traduzir_e_registrar_erro(erro, titulo="Desconhecido"):
@@ -827,6 +855,7 @@ if gemini_key:
 else:
   gemini_key = st.sidebar.text_input("Chave de API do Gemini:", type="password")
 
+st.sidebar.caption(f"📦 Acervo: {contar_livros()} livro(s) salvo(s)")
 st.sidebar.divider()
 
 
@@ -856,6 +885,12 @@ with st.sidebar.expander("🔐 Área do Administrador"):
       st.rerun()
 
 if st.session_state["usuario_role"] == "admin":
+  with st.sidebar.expander("🗄️ Banco de Dados"):
+    st.code(str(DB_PATH), language="text")
+    st.write(f"Livros com resumo: **{contar_livros()}**")
+    if DB_PATH.exists():
+      st.caption(f"Tamanho: {DB_PATH.stat().st_size / 1024:.0f} KB")
+
   with st.sidebar.expander("🛠️ Registro de Erros por Livro"):
     logs = obter_logs_erros()
     if logs:
@@ -905,6 +940,7 @@ with st.expander("🗂️ Pesquisar no Acervo Salvo ou Digitar Novo", expanded=T
       st.session_state["current_query"] = query_final
       st.session_state["idioma_busca"] = idioma
 
+      precisa_recarregar = False
       with st.spinner("Processando informações do livro..."):
         cache = buscar_no_banco(query_final)
         pdf_info = {"url": "", "autor": "", "paginas": 0, "texto_preview": ""}
@@ -925,7 +961,23 @@ with st.expander("🗂️ Pesquisar no Acervo Salvo ou Digitar Novo", expanded=T
               False,
           )
         else:
-          achado = buscar_pdf_relacionado(query_final, idioma)
+          pdf_salvo = bool(cache and cache["pdf_url"])
+          if pdf_salvo:
+            # PDF já vinculado antes (ex.: manualmente): reaproveita
+            achado = {
+                "url": cache["pdf_url"],
+                "autor": cache["autor"] or "",
+                "paginas": cache["paginas"] or 0,
+                "texto_preview": "",
+            }
+            try:
+              achado["texto_preview"] = baixar_pdf_web(cache["pdf_url"])[2][
+                  :TEXTO_PROMPT_MAX
+              ]
+            except Exception:
+              log.info("Não foi possível reler o PDF salvo", exc_info=True)
+          else:
+            achado = buscar_pdf_relacionado(query_final, idioma)
           if achado:
             pdf_info = achado
 
@@ -934,7 +986,7 @@ with st.expander("🗂️ Pesquisar no Acervo Salvo ou Digitar Novo", expanded=T
           )
           st.session_state["geracoes"] += 1
 
-          if achado and trecho_valido is False:
+          if achado and not pdf_salvo and trecho_valido is False:
             # A IA leu o trecho e disse que não é o livro: descarta o PDF
             log.info("IA rejeitou o PDF encontrado: %s", achado["url"])
             pdf_info = {"url": "", "autor": "", "paginas": 0, "texto_preview": ""}
@@ -949,6 +1001,7 @@ with st.expander("🗂️ Pesquisar no Acervo Salvo ou Digitar Novo", expanded=T
                 paginas=pdf_info["paginas"],
                 idioma=idioma,
             )
+            precisa_recarregar = True
 
         st.session_state["resumo"] = resumo_gerado
         st.session_state["resumo_ok"] = resumo_ok
@@ -957,12 +1010,18 @@ with st.expander("🗂️ Pesquisar no Acervo Salvo ou Digitar Novo", expanded=T
             query_final, idioma
         )
 
+      if precisa_recarregar:  # atualiza a lista do acervo com o livro novo
+        st.rerun()
+
 
 # --- EXIBIÇÃO DE RESULTADOS (3 TABS) ---
 if st.session_state.get("search_active"):
   q_atual = st.session_state.get("current_query", "")
   idioma_res = st.session_state.get("idioma_busca", IDIOMA_PADRAO)
   st.markdown(f"### Resultados para: **{q_atual.title()}**")
+  flash = st.session_state.pop("flash", None)
+  if flash:
+    st.toast(flash)
 
   tab1, tab2, tab3 = st.tabs(
       ["📝 1. Resumo & Word", "📄 2. Leitor de PDF", "🎧 3. Audiobooks & Vídeos"]
@@ -1022,7 +1081,9 @@ if st.session_state.get("search_active"):
           try:
             url_manual = manual_url.strip()
             autor, paginas, texto = baixar_pdf_web(url_manual)
-            salvo = atualizar_pdf_no_banco(q_atual, url_manual, autor, paginas)
+            salvar_pdf_manual(
+                q_atual, url_manual, autor, paginas, idioma_res
+            )
 
             st.session_state["pdf_info"] = {
                 "url": url_manual,
@@ -1030,14 +1091,7 @@ if st.session_state.get("search_active"):
                 "paginas": paginas,
                 "texto_preview": texto[:TEXTO_PROMPT_MAX],
             }
-            if salvo:
-              st.toast("PDF vinculado e salvo no banco local!", icon="✅")
-            else:
-              st.toast(
-                  "PDF vinculado só nesta sessão: gere o resumo do livro"
-                  " primeiro para salvá-lo no banco.",
-                  icon="⚠️",
-              )
+            st.session_state["flash"] = "✅ PDF vinculado e salvo no banco local!"
             st.rerun()
           except Exception as e:
             st.error(f"O link informado não pôde ser lido: {e}")
