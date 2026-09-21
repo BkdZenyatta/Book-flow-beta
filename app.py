@@ -7,6 +7,9 @@ import os
 import re
 import socket
 import sqlite3
+import threading
+import time
+import unicodedata
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -24,6 +27,14 @@ try:
   from ddgs import DDGS  # pacote novo (pip install ddgs)
 except ImportError:
   from duckduckgo_search import DDGS  # pacote antigo, como fallback
+
+try:
+  from streamlit.runtime.scriptrunner import (
+      add_script_run_ctx,
+      get_script_run_ctx,
+  )
+except Exception:  # versões antigas do Streamlit
+  add_script_run_ctx = get_script_run_ctx = None
 
 st.set_page_config(page_title="Book Flow", page_icon="📚", layout="wide")
 
@@ -44,6 +55,8 @@ MAX_HTML_BYTES = 1_500_000  # limite ao ler páginas HTML em busca de PDFs
 MAX_TEXTO_PDF = 6000  # texto guardado para checar relevância
 TEXTO_PROMPT_MAX = 2500  # trecho enviado ao Gemini / preview
 MAX_GERACOES_SESSAO = 10  # limite de resumos por visitante (chave do servidor)
+PDF_TIMEOUT = 25  # segundos máximos esperando a busca de PDF / audiobooks
+SUMMARY_TIMEOUT = 90  # segundos máximos esperando o resumo da IA
 
 # Sites consultados na busca de PDFs (além do archive.org, que usa API própria)
 SITES_PREFERIDOS = [
@@ -452,7 +465,7 @@ def _baixar_bytes(url, limite, truncar=False):
     if not _url_segura(url):
       raise ValueError("URL não permitida.")
     res = requests.get(
-        url, headers=HEADERS, timeout=12, stream=True, allow_redirects=False
+        url, headers=HEADERS, timeout=8, stream=True, allow_redirects=False
     )
     if res.is_redirect:
       url = urllib.parse.urljoin(url, res.headers.get("Location", ""))
@@ -465,6 +478,9 @@ def _baixar_bytes(url, limite, truncar=False):
   buf = BytesIO()
   try:
     res.raise_for_status()
+    tamanho = res.headers.get("Content-Length", "")
+    if not truncar and tamanho.isdigit() and int(tamanho) > limite:
+      raise ValueError("Arquivo muito grande.")  # nem começa a baixar
     for chunk in res.iter_content(65536):
       buf.write(chunk)
       if buf.tell() > limite:
@@ -488,22 +504,57 @@ def baixar_pdf_web(url):
   return autor, len(reader.pages), texto[:MAX_TEXTO_PDF]
 
 
+def _norm(texto):
+  """Minúsculas e sem acentos, para comparar títulos."""
+  t = unicodedata.normalize("NFKD", texto.lower())
+  return "".join(c for c in t if not unicodedata.combining(c))
+
+
 def _texto_relevante(titulo, texto):
   """Confere se o início do texto (capa / título) bate com o livro buscado.
 
   Títulos curtos (até 3 palavras) exigem todas as palavras; os maiores,
-  pelo menos 70%.
+  pelo menos 70%. Ignora acentos e maiúsculas.
   """
-  t = titulo.lower()
+  t = _norm(titulo)
   palavras = re.findall(r"\w{4,}", t) or re.findall(r"\w+", t)
   if not palavras:
     return False
-  alvo = texto[:1500].lower()
+  alvo = _norm(texto[:2000])
   minimo = 1.0 if len(palavras) <= 3 else 0.7
   return sum(p in alvo for p in palavras) / len(palavras) >= minimo
 
 
-def _tentar_pdf(titulo, url):
+def _com_ctx(fn):
+  """Roda a função numa thread com o contexto do Streamlit (cache e logs)."""
+  ctx = get_script_run_ctx() if get_script_run_ctx else None
+
+  def run(*args, **kwargs):
+    if ctx is not None and add_script_run_ctx is not None:
+      add_script_run_ctx(threading.current_thread(), ctx)
+    return fn(*args, **kwargs)
+
+  return run
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def _ddg_cacheado(query, regiao, max_results):
+  with DDGS(timeout=8) as ddgs:
+    return list(ddgs.text(query, region=regiao, max_results=max_results))
+
+
+def _ddg(query, regiao, max_results=5):
+  """DuckDuckGo com cache de 6h e uma nova tentativa (evita o limite de taxa)."""
+  for tentativa in range(2):
+    try:
+      return _ddg_cacheado(query, regiao, max_results)
+    except Exception:
+      if tentativa == 1:
+        raise
+      time.sleep(1.5)
+
+
+def _tentar_pdf(titulo, url, validar=None):
   """Baixa o PDF e só o aceita se parecer o livro. Retorna dict ou None."""
   try:
     autor, paginas, texto = baixar_pdf_web(url)
@@ -512,6 +563,9 @@ def _tentar_pdf(titulo, url):
     return None
   if not _texto_relevante(titulo, texto):
     log.info("PDF descartado por não parecer o livro: %s", url)
+    return None
+  if validar and validar(texto[:TEXTO_PROMPT_MAX]) is False:
+    log.info("PDF rejeitado pela IA: %s", url)
     return None
   return {
       "url": url,
@@ -532,8 +586,8 @@ def _extrair_links_pdf(pagina_url, maximo=2):
   return list(dict.fromkeys(absolutos))[:maximo]
 
 
-# --- BUSCA DE PDFs (archive.org > sites preferidos > web geral) ---
-def buscar_pdf_archive_org(titulo, idioma):
+# --- BUSCA DE PDFs (archive.org e web rodam ao mesmo tempo) ---
+def buscar_pdf_archive_org(titulo, idioma, validar=None):
   """Busca via API oficial do archive.org, filtrando pelo idioma escolhido."""
   termo = " ".join(re.findall(r"\w+", titulo))
   if not termo:
@@ -546,11 +600,11 @@ def buscar_pdf_archive_org(titulo, idioma):
           "q": f"({termo}) AND mediatype:texts AND ({langs})",
           "fl[]": ["identifier", "title"],
           "sort[]": "downloads desc",  # mais populares primeiro
-          "rows": 6,
+          "rows": 4,
           "output": "json",
       },
       headers=HEADERS,
-      timeout=10,
+      timeout=8,
   )
   r.raise_for_status()
   docs = r.json().get("response", {}).get("docs", [])
@@ -561,7 +615,7 @@ def buscar_pdf_archive_org(titulo, idioma):
       continue
     try:
       meta = requests.get(
-          f"https://archive.org/metadata/{ident}", headers=HEADERS, timeout=10
+          f"https://archive.org/metadata/{ident}", headers=HEADERS, timeout=8
       ).json()
       info = meta.get("metadata", {})
       if info.get("access-restricted-item") == "true":
@@ -580,7 +634,10 @@ def buscar_pdf_archive_org(titulo, idioma):
             f"{base}/{urllib.parse.quote(djvu)}", MAX_TEXTO_PDF, truncar=True
         ).decode("utf-8", errors="ignore")
 
-      if not _texto_relevante(titulo, f"{d.get('title', '')} {texto}"):
+      titulo_item = d.get("title", "")
+      if not _texto_relevante(titulo, f"{titulo_item} {texto}"):
+        continue
+      if validar and validar(f"{titulo_item}\n{texto[:TEXTO_PROMPT_MAX]}") is False:
         continue
 
       autor = info.get("creator", "Não especificado")
@@ -598,72 +655,77 @@ def buscar_pdf_archive_org(titulo, idioma):
   return None
 
 
-def buscar_pdf_nos_sites(titulo, idioma):
-  """Pesquisa nos sites da lista SITES_PREFERIDOS e procura PDFs nas páginas."""
-  regiao = IDIOMAS[idioma]["ddg"]
-  for dominio in SITES_PREFERIDOS:
+def buscar_pdf_nos_sites(titulo, idioma, validar=None):
+  """Uma única busca nos sites de SITES_PREFERIDOS; procura PDFs nas páginas."""
+  sites = " OR ".join(f"site:{d}" for d in SITES_PREFERIDOS)
+  try:
+    paginas = _ddg(f"({sites}) {titulo}", IDIOMAS[idioma]["ddg"], 5)
+  except Exception:
+    log.warning("Busca nos sites preferidos falhou", exc_info=True)
+    return None
+
+  for item in paginas[:4]:
+    url = item.get("href", "")
+    if not url:
+      continue
     try:
-      with DDGS(timeout=8) as ddgs:
-        paginas = list(
-            ddgs.text(f"site:{dominio} {titulo}", region=regiao, max_results=3)
-        )
-    except Exception:
-      log.warning("Busca em %s falhou", dominio, exc_info=True)
+      if url.lower().split("?")[0].endswith(".pdf"):
+        candidatos = [url]
+      else:
+        candidatos = _extrair_links_pdf(url)
+    except Exception as e:
+      log.info("Página ignorada (%s): %s", url, e)
       continue
 
-    for item in paginas:
-      url = item.get("href", "")
-      if not url:
-        continue
-      try:
-        if url.lower().split("?")[0].endswith(".pdf"):
-          candidatos = [url]
-        else:
-          candidatos = _extrair_links_pdf(url)
-      except Exception as e:
-        log.info("Página ignorada (%s): %s", url, e)
-        continue
-
-      for pdf_url in candidatos:
-        achado = _tentar_pdf(titulo, pdf_url)
-        if achado:
-          return achado
-  return None
-
-
-def buscar_pdf_web_geral(titulo, idioma):
-  """Último recurso: busca geral por PDFs na web, na região do idioma."""
-  with DDGS(timeout=8) as ddgs:
-    resultados = list(
-        ddgs.text(
-            f"{titulo} filetype:pdf",
-            region=IDIOMAS[idioma]["ddg"],
-            max_results=4,
-        )
-    )
-  for item in resultados:
-    url = item.get("href", "")
-    if url:
-      achado = _tentar_pdf(titulo, url)
+    for pdf_url in candidatos:
+      achado = _tentar_pdf(titulo, pdf_url, validar)
       if achado:
         return achado
   return None
 
 
-def buscar_pdf_relacionado(titulo, idioma):
-  """Tenta as fontes em ordem: archive.org, sites preferidos, web geral."""
-  for busca in (
-      buscar_pdf_archive_org,
-      buscar_pdf_nos_sites,
-      buscar_pdf_web_geral,
-  ):
-    try:
-      achado = busca(titulo, idioma)
-    except Exception:
-      log.warning("Fonte %s falhou", busca.__name__, exc_info=True)
-      continue
-    if achado:
-      return achado
+def buscar_pdf_web_geral(titulo, idioma, validar=None):
+  """Último recurso: busca geral por PDFs na web, na região do idioma."""
+  try:
+    resultados = _ddg(f"{titulo} filetype:pdf", IDIOMAS[idioma]["ddg"], 4)
+  except Exception:
+    log.warning("Busca geral de PDFs falhou", exc_info=True)
+    return None
+  for item in resultados:
+    url = item.get("href", "")
+    if url:
+      achado = _tentar_pdf(titulo, url, validar)
+      if achado:
+        return achado
+  return None
+
+
+def _cadeia_web(titulo, idioma, validar=None):
+  return buscar_pdf_nos_sites(titulo, idioma, validar) or buscar_pdf_web_geral(
+      titulo, idioma, validar
+  )
+
+
+def buscar_pdf_relacionado(titulo, idioma, validar=None):
+  """archive.org e a cadeia web rodam juntos; o archive.org tem prioridade."""
+  inicio = time.time()
+  ex = ThreadPoolExecutor(max_workers=2)
+  try:
+    futuros = [
+        ex.submit(_com_ctx(buscar_pdf_archive_org), titulo, idioma, validar),
+        ex.submit(_com_ctx(_cadeia_web), titulo, idioma, validar),
+    ]
+    for fut in futuros:
+      restante = max(0.1, PDF_TIMEOUT - (time.time() - inicio))
+      try:
+        achado = fut.result(timeout=restante)
+      except Exception:  # inclui timeout
+        log.warning("Fonte de PDF falhou ou demorou demais", exc_info=True)
+        continue
+      if achado:
+        return achado
+  finally:
+    ex.shutdown(wait=False)
   return None
 
 
@@ -698,29 +760,67 @@ def _modelos_disponiveis(api_key):
   return MODELOS_FALLBACK
 
 
-def gerar_resumo_gemini(titulo, texto_base, api_key, idioma=IDIOMA_PADRAO):
-  """Retorna (ok, texto, trecho_valido).
+def _config_rapida():
+  """Pensamento reduzido: respostas bem mais rápidas nos modelos Gemini 3."""
+  try:
+    from google.genai import types
 
-  trecho_valido: True/False se a IA confirmou/negou que o trecho do PDF é do
-  livro; None se não houve resposta sobre isso.
-  """
+    return types.GenerateContentConfig(
+        thinking_config=types.ThinkingConfig(thinking_level="low")
+    )
+  except Exception:
+    return None
+
+
+def _chamar_gemini(client, modelo, prompt):
+  config = _config_rapida()
+  if config is not None:
+    try:
+      return client.models.generate_content(
+          model=modelo, contents=prompt, config=config
+      )
+    except Exception as e:
+      if getattr(e, "code", None) != 400:
+        raise
+      # o modelo não aceita esse parâmetro: tenta de novo sem ele
+  return client.models.generate_content(model=modelo, contents=prompt)
+
+
+def validar_trecho_ia(titulo, trecho, api_key, modelos):
+  """True/False se a IA confirma que o trecho é do livro; None se não deu."""
+  if not (api_key and api_key.strip() and modelos and trecho.strip()):
+    return None
+  prompt = (
+      "Responda apenas SIM ou NAO, sem explicações.\n"
+      f"O trecho abaixo, extraído de um PDF, pertence ao livro '{titulo}'?\n\n"
+      f"Trecho:\n{trecho[:1200]}"
+  )
+  modelo = next((m for m in modelos if "lite" in m), modelos[0])
+  try:
+    client = genai.Client(api_key=api_key.strip())
+    txt = (_chamar_gemini(client, modelo, prompt).text or "").strip()
+  except Exception:
+    log.info("Validação por IA indisponível", exc_info=True)
+    return None
+  m = re.match(r"\s*(SIM|NAO|NÃO)\b", txt, re.I)
+  return (m.group(1).upper() == "SIM") if m else None
+
+
+def gerar_resumo_gemini(titulo, api_key, idioma, modelos):
+  """Retorna (ok, texto). O resumo é feito pelo título, sem depender de PDF."""
   if not api_key or not api_key.strip():
     return False, (
         "🔑 **Chave de API não inserida.** Digite uma chave no menu lateral."
-    ), None
+    )
 
   nome_idioma = IDIOMAS[idioma]["nome"]
   prompt = f"""
     Você é um especialista em literatura. Escreva TODA a resposta em {nome_idioma}.
-    Faça um resumo conciso, envolvente e bem estruturado do livro '{titulo}'.
-    Se o título for ambíguo (por exemplo, apenas um número), considere a obra literária mais conhecida com esse título.
+    Faça um resumo conciso, envolvente e bem estruturado do LIVRO '{titulo}'.
+    Se existir mais de uma obra com esse título (livro, filme, série), resuma a obra literária mais conhecida e cite o autor na visão geral.
+    Não invente informações: se não conhecer o livro, diga isso claramente em vez de inventar.
 
-    Trecho extraído de um PDF (use apenas se for realmente do livro; caso contrário, ignore):
-    {texto_base if texto_base else "Nenhum texto extraído."}
-
-    Formato obrigatório da resposta:
-    - Linha 1: exatamente "TRECHO_DO_LIVRO: SIM" se o trecho acima pertence a esse livro, ou "TRECHO_DO_LIVRO: NAO" se não pertence ou se não há trecho.
-    - Depois, uma linha em branco e o resumo com esta estrutura (traduza os títulos das seções):
+    Estrutura desejada (traduza os títulos das seções):
     1. **Visão Geral e Contexto**
     2. **Principais Tópicos / Capítulos-Chave**
     3. **Conclusão e Ensinamento Central**
@@ -728,17 +828,12 @@ def gerar_resumo_gemini(titulo, texto_base, api_key, idioma=IDIOMA_PADRAO):
 
   client = genai.Client(api_key=api_key.strip())
   ultimo_erro = None
-  for mod in _modelos_disponiveis(api_key.strip()):
+  for mod in modelos or MODELOS_FALLBACK:
     try:
-      resp = client.models.generate_content(model=mod, contents=prompt)
+      resp = _chamar_gemini(client, mod, prompt)
       txt = (resp.text or "").strip()
-      valido = None
-      m = re.match(r"\s*TRECHO_DO_LIVRO:\s*(SIM|NAO|NÃO)\b[^\n]*\n?", txt, re.I)
-      if m:
-        valido = m.group(1).upper() == "SIM"
-        txt = txt[m.end():].strip()
       if txt:
-        return True, txt, valido
+        return True, txt
       ultimo_erro = ValueError("Resposta vazia ou bloqueada pelo modelo.")
     except Exception as e:
       ultimo_erro = e
@@ -748,7 +843,7 @@ def gerar_resumo_gemini(titulo, texto_base, api_key, idioma=IDIOMA_PADRAO):
       ):
         break
 
-  return False, traduzir_e_registrar_erro(ultimo_erro, titulo=titulo), None
+  return False, traduzir_e_registrar_erro(ultimo_erro, titulo=titulo)
 
 
 # --- WORD ---
@@ -829,15 +924,7 @@ def _buscar_audiobooks(query, idioma):
   ids = []
 
   try:
-    with DDGS(timeout=8) as ddgs:
-      resultados = list(
-          ddgs.text(
-              f"site:youtube.com {query} {cfg['audiobook']}",
-              region=cfg["ddg"],
-              max_results=10,
-          )
-      )
-    for r in resultados:
+    for r in _ddg(f"site:youtube.com {query} {cfg['audiobook']}", cfg["ddg"], 10):
       vid = _video_id(r.get("href", ""))
       if vid:
         ids.append(vid)
@@ -873,6 +960,82 @@ def buscar_audiobooks_youtube(query, idioma=IDIOMA_PADRAO):
     return _audiobooks_cacheado(query, idioma)
   except LookupError:
     return []
+
+
+# --- PROCESSAMENTO PARALELO (resumo + PDF + audiobooks ao mesmo tempo) ---
+def _cronometrar(nome, diag, fn, *args):
+  t0 = time.time()
+  try:
+    return fn(*args)
+  finally:
+    diag.append(f"{nome}: {time.time() - t0:.1f}s")
+
+
+def _aguardar(fut, prazo_total, inicio, padrao, nome):
+  restante = max(0.1, prazo_total - (time.time() - inicio))
+  try:
+    return fut.result(timeout=restante)
+  except Exception:  # inclui timeout
+    log.warning("%s falhou ou demorou demais", nome, exc_info=True)
+    return padrao
+
+
+def _pdf_para(titulo, idioma, api_key, modelos, cache):
+  if cache and cache["pdf_url"]:  # PDF já vinculado antes: sem rede
+    return {
+        "url": cache["pdf_url"],
+        "autor": cache["autor"] or "",
+        "paginas": cache["paginas"] or 0,
+        "texto_preview": "",
+    }
+  validar = None
+  if api_key and api_key.strip() and modelos:
+    validar = lambda trecho: validar_trecho_ia(titulo, trecho, api_key, modelos)
+  return buscar_pdf_relacionado(titulo, idioma, validar)
+
+
+def processar_livro(titulo, idioma, api_key, cache):
+  """Faz resumo, PDF e audiobooks em paralelo. Retorna um dict."""
+  diag = []
+  inicio = time.time()
+  chave_ok = bool(api_key and api_key.strip())
+  modelos = _modelos_disponiveis(api_key.strip()) if chave_ok else []
+
+  ex = ThreadPoolExecutor(max_workers=3)
+  try:
+    f_res = ex.submit(
+        _com_ctx(_cronometrar), "Resumo (IA)", diag,
+        gerar_resumo_gemini, titulo, api_key, idioma, modelos,
+    )
+    f_pdf = ex.submit(
+        _com_ctx(_cronometrar), "Busca de PDF", diag,
+        _pdf_para, titulo, idioma, api_key, modelos, cache,
+    )
+    f_vid = ex.submit(
+        _com_ctx(_cronometrar), "Audiobooks", diag,
+        buscar_audiobooks_youtube, titulo, idioma,
+    )
+
+    ok, resumo = _aguardar(
+        f_res, SUMMARY_TIMEOUT, inicio,
+        (False, "⚠️ **Instabilidade na Conexão:** o resumo demorou demais."),
+        "Resumo",
+    )
+    pdf = _aguardar(f_pdf, PDF_TIMEOUT, inicio, None, "PDF")
+    videos = _aguardar(f_vid, PDF_TIMEOUT, inicio, [], "Audiobooks")
+  finally:
+    ex.shutdown(wait=False)
+
+  diag.append(f"PDF: {'encontrado' if pdf else 'nenhum encontrado'}")
+  diag.append(f"Audiobooks válidos: {len(videos)}")
+  diag.append(f"Tempo total: {time.time() - inicio:.1f}s")
+  return {
+      "resumo_ok": ok,
+      "resumo": resumo,
+      "pdf_info": pdf or {"url": "", "autor": "", "paginas": 0, "texto_preview": ""},
+      "videos": videos,
+      "diag": diag,
+  }
 
 
 # --- INTERFACE STREAMLIT ---
@@ -1057,18 +1220,22 @@ with st.expander("🗂️ Pesquisar no Acervo Salvo ou Digitar Novo", expanded=T
       st.session_state["idioma_busca"] = idioma
 
       precisa_recarregar = False
-      with st.spinner("Processando informações do livro..."):
+      with st.spinner("Buscando resumo, PDF e audiobooks..."):
         cache = buscar_no_banco(query_final)
         pdf_info = {"url": "", "autor": "", "paginas": 0, "texto_preview": ""}
+        videos = []
+        diag = []
 
         if cache and cache["resumo"] and cache["idioma"] == idioma:
-          # Tudo vem do banco local, sem rede
+          # Resumo e PDF vêm do banco local, sem IA
           resumo_gerado, resumo_ok = cache["resumo"], True
           pdf_info.update(
               url=cache["pdf_url"] or "",
               autor=cache["autor"] or "",
               paginas=cache["paginas"] or 0,
           )
+          videos = buscar_audiobooks_youtube(query_final, idioma)
+          diag = ["Banco local: resumo e PDF carregados sem usar a IA"]
           st.info("⚡ Dados carregados diretamente do banco de dados local.")
         elif not pode_gerar_com_ia():
           resumo_gerado, resumo_ok = (
@@ -1077,41 +1244,17 @@ with st.expander("🗂️ Pesquisar no Acervo Salvo ou Digitar Novo", expanded=T
               False,
           )
         else:
-          pdf_salvo = bool(cache and cache["pdf_url"])
-          if pdf_salvo:
-            # PDF já vinculado antes (ex.: manualmente): reaproveita
-            achado = {
-                "url": cache["pdf_url"],
-                "autor": cache["autor"] or "",
-                "paginas": cache["paginas"] or 0,
-                "texto_preview": "",
-            }
-            try:
-              achado["texto_preview"] = baixar_pdf_web(cache["pdf_url"])[2][
-                  :TEXTO_PROMPT_MAX
-              ]
-            except Exception:
-              log.info("Não foi possível reler o PDF salvo", exc_info=True)
-          else:
-            achado = buscar_pdf_relacionado(query_final, idioma)
-          if achado:
-            pdf_info = achado
-
-          resumo_ok, resumo_gerado, trecho_valido = gerar_resumo_gemini(
-              query_final, pdf_info["texto_preview"], gemini_key, idioma
-          )
+          r = processar_livro(query_final, idioma, gemini_key, cache)
+          resumo_ok, resumo_gerado = r["resumo_ok"], r["resumo"]
+          pdf_info, videos, diag = r["pdf_info"], r["videos"], r["diag"]
           st.session_state["geracoes"] += 1
-
-          if achado and not pdf_salvo and trecho_valido is False:
-            # A IA leu o trecho e disse que não é o livro: descarta o PDF
-            log.info("IA rejeitou o PDF encontrado: %s", achado["url"])
-            pdf_info = {"url": "", "autor": "", "paginas": 0, "texto_preview": ""}
 
           if resumo_ok:
             salvar_no_banco(
                 query_final,
                 resumo_gerado,
-                fonte="IA",
+                fonte=(cache["fonte"] if cache and cache["pdf_url"] else "IA")
+                or "IA",
                 pdf_url=pdf_info["url"],
                 autor=pdf_info["autor"],
                 paginas=pdf_info["paginas"],
@@ -1122,9 +1265,8 @@ with st.expander("🗂️ Pesquisar no Acervo Salvo ou Digitar Novo", expanded=T
         st.session_state["resumo"] = resumo_gerado
         st.session_state["resumo_ok"] = resumo_ok
         st.session_state["pdf_info"] = pdf_info
-        st.session_state["audiobooks"] = buscar_audiobooks_youtube(
-            query_final, idioma
-        )
+        st.session_state["audiobooks"] = videos
+        st.session_state["diag"] = diag
 
       if precisa_recarregar:  # atualiza a lista do acervo com o livro novo
         st.rerun()
@@ -1138,6 +1280,10 @@ if st.session_state.get("search_active"):
   flash = st.session_state.pop("flash", None)
   if flash:
     st.toast(flash)
+  if st.session_state["usuario_role"] == "admin" and st.session_state.get("diag"):
+    with st.expander("⏱️ Diagnóstico da busca (admin)"):
+      for linha in st.session_state["diag"]:
+        st.write(linha)
 
   tab1, tab2, tab3 = st.tabs(
       ["📝 1. Resumo & Word", "📄 2. Leitor de PDF", "🎧 3. Audiobooks & Vídeos"]
